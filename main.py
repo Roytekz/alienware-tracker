@@ -9,12 +9,14 @@ from datetime import datetime
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-POLL_INTERVAL = 25
+# 60s interval stays well within Reddit's unauthenticated RSS rate limit
+POLL_INTERVAL = 60
 DATABASE_FILE = "alienware_state.json"
 RSS_URL = "https://www.reddit.com/r/FreeGameFindings/new.rss"
 
+# Reddit-compliant script User-Agent
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AlienwareHunter/5.0"
+    "User-Agent": "python:alienware-arena-monitor:v1.0 (by /u/roytekz_tracker)"
 }
 
 def load_state():
@@ -103,13 +105,43 @@ def update_to_out_of_keys(message_id, drop_data, duration_str):
     except Exception as e:
         print(f"Failed to patch Discord message: {e}", flush=True)
 
+# Cache headers across runs to save quota
+etag_cache = None
+last_modified_cache = None
+
 def fetch_feed_drops():
+    global etag_cache, last_modified_cache
     parsed_items = []
+    
+    req_headers = dict(HEADERS)
+    if etag_cache:
+        req_headers["If-None-Match"] = etag_cache
+    if last_modified_cache:
+        req_headers["If-Modified-Since"] = last_modified_cache
+
     try:
-        res = requests.get(RSS_URL, headers=HEADERS, timeout=15)
+        res = requests.get(RSS_URL, headers=req_headers, timeout=15)
+
+        # 304 = Feed hasn't changed since last check (saves rate limit)
+        if res.status_code == 304:
+            return None
+
+        # 429 = Rate limited -> Back off for 60 seconds
+        if res.status_code == 429:
+            retry_after = int(res.headers.get("Retry-After", 60))
+            print(f"⚠️ Rate limited (429). Cooling down for {retry_after}s...", flush=True)
+            time.sleep(retry_after)
+            return None
+
         if res.status_code != 200:
             print(f"Feed error {res.status_code}", flush=True)
-            return parsed_items
+            return None
+
+        # Update cache headers on successful response
+        if "ETag" in res.headers:
+            etag_cache = res.headers["ETag"]
+        if "Last-Modified" in res.headers:
+            last_modified_cache = res.headers["Last-Modified"]
 
         root = ET.fromstring(res.text)
         namespace = {'atom': 'http://www.w3.org/2005/Atom'}
@@ -121,7 +153,6 @@ def fetch_feed_drops():
             content_elem = entry.find('atom:content', namespace)
             content_html = content_elem.text if content_elem is not None else ""
 
-            # Check categories for link flair (Expired, Ended, etc.)
             flairs = []
             for cat in entry.findall('atom:category', namespace):
                 term = cat.attrib.get('term', '')
@@ -130,7 +161,6 @@ def fetch_feed_drops():
 
             is_expired = any(x in " ".join(flairs) for x in ["expired", "out of keys", "ended"])
 
-            # Filter for Alienware Arena posts only
             is_alienware = (
                 "alienwarearena.com" in content_html.lower() or 
                 "alienware" in raw_title.lower()
@@ -138,7 +168,6 @@ def fetch_feed_drops():
             if not is_alienware:
                 continue
 
-            # Extract the actual giveaway link
             url_match = re.search(r'href="(https://[a-zA-Z0-9\.\-_]*alienwarearena\.com[^\"]*)"', content_html)
             claim_url = url_match.group(1) if url_match else "https://www.alienwarearena.com"
 
@@ -153,10 +182,6 @@ def fetch_feed_drops():
             elif "gog" in raw_title.lower():
                 platform = "GOG"
 
-            # Accurate Image Extraction:
-            # 1. Look for custom image embedded in post
-            # 2. Or if Steam store link is present, extract its exact Steam app ID
-            # 3. Else None (No inaccurate fallback)
             image_url = None
             img_match = re.search(r'<img[^>]+src="(https://preview\.redd\.it/[^\"]+)"', content_html)
             if img_match:
@@ -178,6 +203,7 @@ def fetch_feed_drops():
 
     except Exception as e:
         print(f"Error parsing feed: {e}", flush=True)
+        return None
 
     return parsed_items
 
@@ -185,60 +211,62 @@ def run():
     print("🛰️ Alienware Arena Hunter active...", flush=True)
     state = load_state()
 
-    # Initial scan: Log existing items into state so past items aren't spammed
+    # Initial baseline sync
     initial_drops = fetch_feed_drops()
-    for item in initial_drops:
-        if item["id"] not in state:
-            state[item["id"]] = {
-                "message_id": None,
-                "first_seen": item["created_utc"],
-                "title": item["title"],
-                "data": item,
-                "status": "out_of_keys" if item["is_expired"] else "active"
-            }
-    save_state(state)
+    if initial_drops is not None:
+        for item in initial_drops:
+            if item["id"] not in state:
+                state[item["id"]] = {
+                    "message_id": None,
+                    "first_seen": item["created_utc"],
+                    "title": item["title"],
+                    "data": item,
+                    "status": "out_of_keys" if item["is_expired"] else "active"
+                }
+        save_state(state)
     print("✅ Baseline synced. Waiting for live upcoming drops...", flush=True)
 
-    # 24/7 Monitoring Loop
     while True:
         drops = fetch_feed_drops()
-        for item in drops:
-            drop_id = item["id"]
+        
+        # None means 304 (unchanged) or temporary backoff
+        if drops is not None:
+            for item in drops:
+                drop_id = item["id"]
 
-            # Brand new drop appears that wasn't in state
-            if drop_id not in state:
-                if not item["is_expired"]:
-                    print(f"🔥 [NEW DROP DETECTED]: {item['title']}", flush=True)
-                    msg_id = post_alert(item, is_active=True)
-                    state[drop_id] = {
-                        "message_id": msg_id,
-                        "first_seen": time.time(),
-                        "title": item["title"],
-                        "data": item,
-                        "status": "active"
-                    }
-                    save_state(state)
-                else:
-                    # Drop was already posted and expired before we saw it
-                    state[drop_id] = {
-                        "message_id": None,
-                        "first_seen": time.time(),
-                        "title": item["title"],
-                        "data": item,
-                        "status": "out_of_keys"
-                    }
-                    save_state(state)
+                # New active drop detected
+                if drop_id not in state:
+                    if not item["is_expired"]:
+                        print(f"🔥 [NEW DROP DETECTED]: {item['title']}", flush=True)
+                        msg_id = post_alert(item, is_active=True)
+                        state[drop_id] = {
+                            "message_id": msg_id,
+                            "first_seen": time.time(),
+                            "title": item["title"],
+                            "data": item,
+                            "status": "active"
+                        }
+                        save_state(state)
+                    else:
+                        state[drop_id] = {
+                            "message_id": None,
+                            "first_seen": time.time(),
+                            "title": item["title"],
+                            "data": item,
+                            "status": "out_of_keys"
+                        }
+                        save_state(state)
 
-            # Active drop in channel runs out of keys
-            elif state[drop_id]["status"] == "active" and item["is_expired"]:
-                if state[drop_id].get("message_id"):
-                    start_time = state[drop_id].get("first_seen", item["created_utc"])
-                    duration = calculate_duration(time.time() - start_time)
-                    print(f"🛑 [OUT OF KEYS]: {item['title']} ({duration})", flush=True)
-                    update_to_out_of_keys(state[drop_id]["message_id"], state[drop_id]["data"], duration)
-                
-                state[drop_id]["status"] = "out_of_keys"
-                save_state(state)
+                # Existing active drop marked expired
+                elif state[drop_id]["status"] == "active" and item["is_expired"]:
+                    if state[drop_id].get("message_id"):
+                        start_time = state[drop_id].get("first_seen", item["created_utc"])
+                        duration = calculate_duration(time.time() - start_time)
+                        print(f"🛑 [OUT OF KEYS]: {item['title']} ({duration})", flush=True)
+                        update_to_out_of_keys(state[drop_id]["message_id"], state[drop_id]["data"], duration)
+                    
+                    state[drop_id]["status"] = "out_of_keys"
+                    save_state(state)
 
         sys.stdout.flush()
         time.sleep(POLL_INTERVAL)
