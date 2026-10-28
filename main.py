@@ -12,7 +12,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 POLL_INTERVAL = 30
 DATABASE_FILE = "alienware_state.json"
 
-# Proxied Reddit RSS endpoint (Completely bypasses Reddit datacenter rate-limits)
+# Proxied Reddit RSS endpoints to avoid cloud rate limits
 PRIMARY_RSS = "https://api.allorigins.win/raw?url=https://www.reddit.com/r/FreeGameFindings/new.rss"
 FALLBACK_RSS = "https://api.codetabs.com/v1/proxy?quest=https://www.reddit.com/r/FreeGameFindings/new.rss"
 
@@ -40,6 +40,26 @@ def calculate_duration(seconds):
         return f"{hours}h {mins}m {secs}s"
     return f"{mins}m {secs}s"
 
+def fetch_steam_artwork_by_title(title):
+    """Queries Steam's store search API to dynamically find the game's official Steam App ID and header."""
+    try:
+        # Strip generic tags/prompts to focus on clean title
+        clean_name = re.sub(r'\[.*?\]|\(.*?\)', '', title)
+        clean_name = re.sub(r'giveaway|steam|game key|dlc|beta|edition|pack', '', clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_name).strip()
+
+        search_url = f"https://store.steampowered.com/api/storesearch/?term={requests.utils.quote(clean_name)}&l=english&cc=US"
+        resp = requests.get(search_url, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items", [])
+            if items:
+                app_id = items[0].get("id")
+                return f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{app_id}/header.jpg"
+    except Exception:
+        pass
+    return None
+
 def build_embed(data, is_active=True, duration_str=""):
     title = data.get("title", "Alienware Key Giveaway")
     claim_url = data.get("url", "https://www.alienwarearena.com")
@@ -52,7 +72,7 @@ def build_embed(data, is_active=True, duration_str=""):
             "title": title,
             "url": claim_url,
             "description": f"Keys are live now! 👉 **[Click Here to Claim]({claim_url})**",
-            "color": 3447003,
+            "color": 3447003,  # Blue sidebar
             "fields": [
                 {"name": "Status", "value": "🟢 Active", "inline": True},
                 {"name": "Platform", "value": f"🎮 {platform}", "inline": True},
@@ -67,7 +87,7 @@ def build_embed(data, is_active=True, duration_str=""):
             "title": title,
             "url": claim_url,
             "description": duration_display,
-            "color": 15158332,
+            "color": 15158332,  # Red sidebar
             "fields": [
                 {"name": "Status", "value": "❌ Out of keys", "inline": True},
                 {"name": "Platform", "value": f"🎮 {platform}", "inline": True},
@@ -82,7 +102,7 @@ def build_embed(data, is_active=True, duration_str=""):
 
 def post_alert(drop_data, is_active=True, duration_str=""):
     if not WEBHOOK_URL:
-        print("Missing WEBHOOK_URL!", flush=True)
+        print("Missing WEBHOOK_URL environment variable!", flush=True)
         return None
     embed = build_embed(drop_data, is_active=is_active, duration_str=duration_str)
     target = f"{WEBHOOK_URL}?wait=true"
@@ -90,6 +110,8 @@ def post_alert(drop_data, is_active=True, duration_str=""):
         r = requests.post(target, json={"embeds": [embed]}, timeout=10)
         if r.status_code in (200, 201):
             return r.json().get("id")
+        else:
+            print(f"Discord Post Error {r.status_code}: {r.text}", flush=True)
     except Exception as e:
         print(f"Error publishing: {e}", flush=True)
     return None
@@ -108,7 +130,6 @@ def fetch_feed_drops():
     parsed_items = []
     xml_content = None
 
-    # Try Primary Proxy, then Fallback Proxy
     for endpoint in [PRIMARY_RSS, FALLBACK_RSS]:
         try:
             res = requests.get(endpoint, headers=HEADERS, timeout=12)
@@ -132,6 +153,7 @@ def fetch_feed_drops():
             content_elem = entry.find('atom:content', namespace)
             content_html = content_elem.text if content_elem is not None else ""
 
+            # Check category tags for expired status
             flairs = []
             for cat in entry.findall('atom:category', namespace):
                 term = cat.attrib.get('term', '')
@@ -140,6 +162,7 @@ def fetch_feed_drops():
 
             is_expired = any(x in " ".join(flairs) for x in ["expired", "out of keys", "ended"])
 
+            # Filter for Alienware Arena posts
             is_alienware = (
                 "alienwarearena.com" in content_html.lower() or 
                 "alienware" in raw_title.lower()
@@ -147,6 +170,7 @@ def fetch_feed_drops():
             if not is_alienware:
                 continue
 
+            # Extract giveaway URL
             url_match = re.search(r'href="(https://[a-zA-Z0-9\.\-_]*alienwarearena\.com[^\"]*)"', content_html)
             claim_url = url_match.group(1) if url_match else "https://www.alienwarearena.com"
 
@@ -159,14 +183,21 @@ def fetch_feed_drops():
             if "epic" in raw_title.lower(): platform = "Epic Games"
             elif "gog" in raw_title.lower(): platform = "GOG"
 
+            # Artwork Pipeline: 
+            # 1. Direct AppID in post -> 2. Steam Search by clean name -> 3. Reddit's uploaded preview
             image_url = None
-            img_match = re.search(r'<img[^>]+src="(https://preview\.redd\.it/[^\"]+)"', content_html)
-            if img_match:
-                image_url = img_match.group(1).replace("&amp;", "&")
-            else:
-                steam_match = re.search(r'store\.steampowered\.com/app/(\d+)', content_html)
-                if steam_match:
-                    image_url = f"https://cdn.akamai.steamstatic.com/steam/apps/{steam_match.group(1)}/header.jpg"
+            steam_match = re.search(r'store\.steampowered\.com/app/(\d+)', content_html)
+            if steam_match:
+                app_id = steam_match.group(1)
+                image_url = f"https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{app_id}/header.jpg"
+
+            if not image_url and platform == "Steam":
+                image_url = fetch_steam_artwork_by_title(clean_title)
+
+            if not image_url:
+                img_match = re.search(r'<img[^>]+src="(https://preview\.redd\.it/[^\"]+)"', content_html)
+                if img_match:
+                    image_url = img_match.group(1).replace("&amp;", "&")
 
             parsed_items.append({
                 "id": post_id,
@@ -188,7 +219,7 @@ def run():
     print("🛰️ Alienware Arena Hunter active...", flush=True)
     state = load_state()
 
-    # Initial Baseline Sync
+    # Establish baseline silently so old drops are never spammed
     initial_drops = fetch_feed_drops()
     if initial_drops is not None:
         for item in initial_drops:
@@ -232,7 +263,7 @@ def run():
                         }
                         save_state(state)
 
-                # Active drop marked expired
+                # Existing active drop marked expired
                 elif state[drop_id]["status"] == "active" and item["is_expired"]:
                     if state[drop_id].get("message_id"):
                         start_time = state[drop_id].get("first_seen", item["created_utc"])
