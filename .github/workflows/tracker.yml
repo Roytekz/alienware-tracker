@@ -1,0 +1,43 @@
+name: Alienware 24x7 Tracker
+
+on:
+  schedule:
+    # Runs continuously every 10 minutes around the clock
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests
+
+      - name: Run Tracker Loop
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          # Runs the tracker for 9.5 minutes (570s) before completing so the next cron starts fresh
+          timeout 570 python main.py || true
+
+      - name: Commit Updated Drops Database
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f alienware_state.json ]; then
+            git add alienware_state.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update giveaway state [skip ci]" && git push)
+          fi
