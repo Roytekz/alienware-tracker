@@ -9,14 +9,15 @@ from datetime import datetime
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# 60s interval stays well within Reddit's unauthenticated RSS rate limit
-POLL_INTERVAL = 60
+POLL_INTERVAL = 30
 DATABASE_FILE = "alienware_state.json"
-RSS_URL = "https://www.reddit.com/r/FreeGameFindings/new.rss"
 
-# Reddit-compliant script User-Agent
+# Proxied Reddit RSS endpoint (Completely bypasses Reddit datacenter rate-limits)
+PRIMARY_RSS = "https://api.allorigins.win/raw?url=https://www.reddit.com/r/FreeGameFindings/new.rss"
+FALLBACK_RSS = "https://api.codetabs.com/v1/proxy?quest=https://www.reddit.com/r/FreeGameFindings/new.rss"
+
 HEADERS = {
-    "User-Agent": "python:alienware-arena-monitor:v1.0 (by /u/roytekz_tracker)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
 }
 
 def load_state():
@@ -51,7 +52,7 @@ def build_embed(data, is_active=True, duration_str=""):
             "title": title,
             "url": claim_url,
             "description": f"Keys are live now! 👉 **[Click Here to Claim]({claim_url})**",
-            "color": 3447003,  # Blue
+            "color": 3447003,
             "fields": [
                 {"name": "Status", "value": "🟢 Active", "inline": True},
                 {"name": "Platform", "value": f"🎮 {platform}", "inline": True},
@@ -66,7 +67,7 @@ def build_embed(data, is_active=True, duration_str=""):
             "title": title,
             "url": claim_url,
             "description": duration_display,
-            "color": 15158332,  # Red
+            "color": 15158332,
             "fields": [
                 {"name": "Status", "value": "❌ Out of keys", "inline": True},
                 {"name": "Platform", "value": f"🎮 {platform}", "inline": True},
@@ -81,7 +82,7 @@ def build_embed(data, is_active=True, duration_str=""):
 
 def post_alert(drop_data, is_active=True, duration_str=""):
     if not WEBHOOK_URL:
-        print("Missing WEBHOOK_URL environment variable!", flush=True)
+        print("Missing WEBHOOK_URL!", flush=True)
         return None
     embed = build_embed(drop_data, is_active=is_active, duration_str=duration_str)
     target = f"{WEBHOOK_URL}?wait=true"
@@ -89,8 +90,6 @@ def post_alert(drop_data, is_active=True, duration_str=""):
         r = requests.post(target, json={"embeds": [embed]}, timeout=10)
         if r.status_code in (200, 201):
             return r.json().get("id")
-        else:
-            print(f"Discord Post Error {r.status_code}: {r.text}", flush=True)
     except Exception as e:
         print(f"Error publishing: {e}", flush=True)
     return None
@@ -105,45 +104,25 @@ def update_to_out_of_keys(message_id, drop_data, duration_str):
     except Exception as e:
         print(f"Failed to patch Discord message: {e}", flush=True)
 
-# Cache headers across runs to save quota
-etag_cache = None
-last_modified_cache = None
-
 def fetch_feed_drops():
-    global etag_cache, last_modified_cache
     parsed_items = []
-    
-    req_headers = dict(HEADERS)
-    if etag_cache:
-        req_headers["If-None-Match"] = etag_cache
-    if last_modified_cache:
-        req_headers["If-Modified-Since"] = last_modified_cache
+    xml_content = None
+
+    # Try Primary Proxy, then Fallback Proxy
+    for endpoint in [PRIMARY_RSS, FALLBACK_RSS]:
+        try:
+            res = requests.get(endpoint, headers=HEADERS, timeout=12)
+            if res.status_code == 200 and "<feed" in res.text:
+                xml_content = res.text
+                break
+        except Exception:
+            continue
+
+    if not xml_content:
+        return None
 
     try:
-        res = requests.get(RSS_URL, headers=req_headers, timeout=15)
-
-        # 304 = Feed hasn't changed since last check (saves rate limit)
-        if res.status_code == 304:
-            return None
-
-        # 429 = Rate limited -> Back off for 60 seconds
-        if res.status_code == 429:
-            retry_after = int(res.headers.get("Retry-After", 60))
-            print(f"⚠️ Rate limited (429). Cooling down for {retry_after}s...", flush=True)
-            time.sleep(retry_after)
-            return None
-
-        if res.status_code != 200:
-            print(f"Feed error {res.status_code}", flush=True)
-            return None
-
-        # Update cache headers on successful response
-        if "ETag" in res.headers:
-            etag_cache = res.headers["ETag"]
-        if "Last-Modified" in res.headers:
-            last_modified_cache = res.headers["Last-Modified"]
-
-        root = ET.fromstring(res.text)
+        root = ET.fromstring(xml_content)
         namespace = {'atom': 'http://www.w3.org/2005/Atom'}
 
         for entry in root.findall('atom:entry', namespace):
@@ -177,10 +156,8 @@ def fetch_feed_drops():
             clean_title = re.sub(r'\[.*?\]|\(.*?\)', '', raw_title).strip() or raw_title
 
             platform = "Steam"
-            if "epic" in raw_title.lower():
-                platform = "Epic Games"
-            elif "gog" in raw_title.lower():
-                platform = "GOG"
+            if "epic" in raw_title.lower(): platform = "Epic Games"
+            elif "gog" in raw_title.lower(): platform = "GOG"
 
             image_url = None
             img_match = re.search(r'<img[^>]+src="(https://preview\.redd\.it/[^\"]+)"', content_html)
@@ -202,7 +179,7 @@ def fetch_feed_drops():
             })
 
     except Exception as e:
-        print(f"Error parsing feed: {e}", flush=True)
+        print(f"Error parsing feed XML: {e}", flush=True)
         return None
 
     return parsed_items
@@ -211,7 +188,7 @@ def run():
     print("🛰️ Alienware Arena Hunter active...", flush=True)
     state = load_state()
 
-    # Initial baseline sync
+    # Initial Baseline Sync
     initial_drops = fetch_feed_drops()
     if initial_drops is not None:
         for item in initial_drops:
@@ -224,17 +201,15 @@ def run():
                     "status": "out_of_keys" if item["is_expired"] else "active"
                 }
         save_state(state)
-    print("✅ Baseline synced. Waiting for live upcoming drops...", flush=True)
+    print("✅ Baseline synced cleanly. Live monitoring active...", flush=True)
 
     while True:
         drops = fetch_feed_drops()
-        
-        # None means 304 (unchanged) or temporary backoff
         if drops is not None:
             for item in drops:
                 drop_id = item["id"]
 
-                # New active drop detected
+                # New drop detected
                 if drop_id not in state:
                     if not item["is_expired"]:
                         print(f"🔥 [NEW DROP DETECTED]: {item['title']}", flush=True)
@@ -257,14 +232,13 @@ def run():
                         }
                         save_state(state)
 
-                # Existing active drop marked expired
+                # Active drop marked expired
                 elif state[drop_id]["status"] == "active" and item["is_expired"]:
                     if state[drop_id].get("message_id"):
                         start_time = state[drop_id].get("first_seen", item["created_utc"])
                         duration = calculate_duration(time.time() - start_time)
                         print(f"🛑 [OUT OF KEYS]: {item['title']} ({duration})", flush=True)
                         update_to_out_of_keys(state[drop_id]["message_id"], state[drop_id]["data"], duration)
-                    
                     state[drop_id]["status"] = "out_of_keys"
                     save_state(state)
 
