@@ -6,7 +6,7 @@ import requests
 from datetime import datetime
 
 # Reads the webhook URL securely from cloud environment variables
-WEBHOOK_URL = os.getenv("https://discord.com/api/webhooks/1564842633564655636/NEbsSJTs2E5skrmGKEU799ppS8sW8fbr8LXdFw2rL87cSUz2TDFjpREyVFYlz0c9QSQa")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 POLL_INTERVAL = 25
 DATABASE_FILE = "alienware_state.json"
