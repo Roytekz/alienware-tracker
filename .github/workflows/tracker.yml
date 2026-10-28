@@ -1,9 +1,9 @@
-name: Alienware Fast Pulse Tracker
+name: Alienware 24x7 Tracker
 
 on:
   schedule:
-    # Runs a quick 5-second check every 15 minutes
-    - cron: '*/15 * * * *'
+    # Runs continuously every 10 minutes around the clock
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -22,18 +22,22 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: |
+          pip install --upgrade pip
+          pip install requests
 
-      - name: Single Scan
+      - name: Run Tracker Loop
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: python main.py --single-run
+        run: |
+          # Runs the tracker for 9.5 minutes (570s) before completing so the next cron starts fresh
+          timeout 570 python main.py || true
 
-      - name: Commit State
+      - name: Commit Updated Drops Database
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           if [ -f alienware_state.json ]; then
             git add alienware_state.json
-            git diff --quiet && git diff --staged --quiet || (git commit -m "Update state [skip ci]" && git push)
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update giveaway state [skip ci]" && git push)
           fi
